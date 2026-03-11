@@ -1,1223 +1,167 @@
-#!/usr/bin/env python3
-"""
-Platinum Guarant Bot - Гарант-бот для P2P сделок
-Администраторы: @usdater, @BroNeyn
-"""
-
-import requests
-import sqlite3
-import json
-import time
+import asyncio
+from telethon import TelegramClient, events
+import logging
+import random
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# ==================== НАСТРОЙКИ ====================
-TOKEN = "7921261793:AAHHgZXlVxmH10qy_Oyg-wWHjRq6781AsYc"
-ADMIN_USERNAMES = ["usdater", "BroNeyn"]
-SUPPORT_CHANNEL = "@PlatinumGuarantSupport"
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
+# ============================================
+# ТВОИ ДАННЫЕ (обновлено)
+# ============================================
+API_ID = 32680352
+API_HASH = 'b2951f1f376d4f6775052c7b9b03ec9a'
+PHONE_NUMBER = '+15709935845'  # Новый номер
+CHANNEL_LINK = 'https://t.me/Goal24main'  # Канал Goal24
 
-COMMISSION_RATE = 3.0
-MIN_DEAL_AMOUNT = 1
-DEAL_EXPIRE_HOURS = 24
+# Настройки
+COMMENT_TEXT = 'ого'  # Комментарий
+CHECK_INTERVAL = 5  # Проверка каждые 5 секунд
 
-CURRENCIES = {
-    'RUB': {'name': 'Рубль', 'symbol': '₽', 'emoji': '🇷🇺'},
-    'USD': {'name': 'Доллар', 'symbol': '$', 'emoji': '🇺🇸'},
-    'EUR': {'name': 'Евро', 'symbol': '€', 'emoji': '🇪🇺'},
-    'TON': {'name': 'TON', 'symbol': '💎', 'emoji': '💎'},
-    'TELEGRAM_STARS': {'name': 'Telegram Stars', 'symbol': '⭐', 'emoji': '⭐'},  # Добавлена валюта Telegram Stars
-}
+# ============================================
+# КОД БОТА (ниже ничего не трогай)
+# ============================================
 
-DATA_DIR = "bot_data"
-MEDIA_FILE = os.path.join(DATA_DIR, "welcome_photo.json")
-os.makedirs(DATA_DIR, exist_ok=True)
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-# ==================== СИСТЕМА МЕДИА ====================
-class MediaManager:
-    def __init__(self):
-        self.welcome_photo = self.load_welcome_photo()
-    
-    def load_welcome_photo(self):
-        try:
-            if os.path.exists(MEDIA_FILE):
-                with open(MEDIA_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except:
-            pass
-        return None
-    
-    def save_welcome_photo(self, file_id):
-        self.welcome_photo = file_id
-        try:
-            with open(MEDIA_FILE, 'w', encoding='utf-8') as f:
-                json.dump(file_id, f, ensure_ascii=False)
-            return True
-        except:
-            return False
-    
-    def get_welcome_photo(self):
-        return self.welcome_photo
+# Хранилище обработанных постов
+try:
+    with open('goal24_processed.txt', 'r') as f:
+        processed_posts = set(int(line.strip()) for line in f)
+    print(f"📝 Загружено {len(processed_posts)} ранее обработанных постов")
+except FileNotFoundError:
+    processed_posts = set()
+    print("📝 Новый файл с постами будет создан")
 
-media_manager = MediaManager()
+def save_post(post_id):
+    """Сохраняет ID поста в файл"""
+    with open('goal24_processed.txt', 'a') as f:
+        f.write(f"{post_id}\n")
 
-# ==================== БАЗА ДАННЫХ ====================
-class Database:
-    def __init__(self):
-        self.conn = None
-        self.connect()
-        self.init_db()
+async def main():
+    # Создаем клиента
+    client = TelegramClient('goal24_session', API_ID, API_HASH)
     
-    def connect(self):
-        """Создаем соединение с базой данных"""
-        try:
-            self.conn = sqlite3.connect('platinum.db', check_same_thread=False, timeout=10)
-            self.conn.execute("PRAGMA journal_mode=WAL")  # Включаем режим WAL для лучшей производительности
-            print("✅ Подключение к базе данных установлено")
-        except Exception as e:
-            print(f"❌ Ошибка подключения к базе данных: {e}")
-            # Пробуем создать новую базу
-            try:
-                self.conn = sqlite3.connect('platinum_new.db', check_same_thread=False, timeout=10)
-                print("✅ Создана новая база данных")
-            except:
-                print("❌ Не удалось создать базу данных")
-                raise
+    print("\n" + "="*45)
+    print("⚽ БОТ ДЛЯ КАНАЛА @Goal24")
+    print("="*45)
+    print(f"📱 Номер: {PHONE_NUMBER}")
+    print(f"📺 Канал: {CHANNEL_LINK}")
+    print(f"💬 Комментарий: '{COMMENT_TEXT}'")
+    print("="*45 + "\n")
     
-    def init_db(self):
-        cursor = self.conn.cursor()
-        
-        # Создаем таблицу users
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                is_admin BOOLEAN DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Проверяем существование таблицы deals
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='deals'")
-        if not cursor.fetchone():
-            # Создаем таблицу deals с нуля
-            cursor.execute('''
-                CREATE TABLE deals (
-                    id TEXT PRIMARY KEY,
-                    seller_id INTEGER NOT NULL,
-                    seller_username TEXT NOT NULL,
-                    buyer_id INTEGER,
-                    buyer_username TEXT,
-                    amount REAL NOT NULL,
-                    currency TEXT DEFAULT 'RUB',
-                    payment_method TEXT,
-                    payment_data TEXT,
-                    status TEXT DEFAULT 'created',
-                    nft_sent BOOLEAN DEFAULT 0,
-                    admin_check BOOLEAN DEFAULT 0,
-                    check_requested BOOLEAN DEFAULT 0,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TEXT,
-                    completed_at TEXT
-                )
-            ''')
-            print("✅ Таблица deals создана")
-        else:
-            # Проверяем структуру существующей таблицы
-            cursor.execute("PRAGMA table_info(deals)")
-            columns = [col[1] for col in cursor.fetchall()]
-            
-            # Добавляем отсутствующие колонки
-            required_columns = ['nft_sent', 'admin_check', 'check_requested', 'completed_at']
-            for column in required_columns:
-                if column not in columns:
-                    try:
-                        if column == 'completed_at':
-                            cursor.execute(f"ALTER TABLE deals ADD COLUMN {column} TEXT")
-                        else:
-                            cursor.execute(f"ALTER TABLE deals ADD COLUMN {column} BOOLEAN DEFAULT 0")
-                        print(f"✅ Добавлена колонка {column}")
-                    except Exception as e:
-                        print(f"⚠️ Не удалось добавить колонку {column}: {e}")
-        
-        # Создаем таблицу payment_methods
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS payment_methods (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                type TEXT NOT NULL,
-                data TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Создаем таблицу user_states
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_states (
-                user_id INTEGER PRIMARY KEY,
-                state TEXT,
-                data TEXT
-            )
-        ''')
-        
-        self.conn.commit()
-        print("✅ База данных инициализирована")
-    
-    def save_user(self, user_data):
-        try:
-            cursor = self.conn.cursor()
-            # Проверяем если пользователь является администратором
-            is_admin = 1 if str(user_data.get('username')).lower() in [admin.lower() for admin in ADMIN_USERNAMES] else 0
-            cursor.execute('''
-                INSERT OR REPLACE INTO users 
-                (user_id, username, first_name, last_name, is_admin)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (
-                user_data['id'],
-                user_data.get('username', ''),
-                user_data.get('first_name', ''),
-                user_data.get('last_name', ''),
-                is_admin
-            ))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            print(f"❌ Ошибка сохранения пользователя: {e}")
-            return False
-    
-    def get_user(self, user_id):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            if row:
-                return {
-                    'user_id': row[0],
-                    'username': row[1],
-                    'first_name': row[2],
-                    'last_name': row[3],
-                    'is_admin': bool(row[4])
-                }
-            return None
-        except Exception as e:
-            print(f"❌ Ошибка получения пользователя: {e}")
-            return None
-    
-    def get_admins(self):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT user_id FROM users WHERE is_admin = 1")
-            return [row[0] for row in cursor.fetchall()]
-        except Exception as e:
-            print(f"❌ Ошибка получения администраторов: {e}")
-            # Возвращаем пустой список если нет администраторов в БД
-            return []
-    
-    def has_payment_methods(self, user_id):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM payment_methods WHERE user_id = ?", (user_id,))
-            return cursor.fetchone()[0] > 0
-        except Exception as e:
-            print(f"❌ Ошибка проверки реквизитов: {e}")
-            return False
-    
-    def get_payment_methods(self, user_id):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT * FROM payment_methods WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
-            rows = cursor.fetchall()
-            return [{'id': row[0], 'type': row[2], 'data': row[3]} for row in rows]
-        except Exception as e:
-            print(f"❌ Ошибка получения реквизитов: {e}")
-            return []
-    
-    def add_payment_method(self, user_id, method_type, data):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                INSERT INTO payment_methods (user_id, type, data)
-                VALUES (?, ?, ?)
-            ''', (user_id, method_type, data))
-            self.conn.commit()
-            return cursor.lastrowid
-        except Exception as e:
-            print(f"❌ Ошибка добавления реквизита: {e}")
-            return None
-    
-    def create_deal(self, seller_id, seller_username, amount, currency, payment_method, payment_data):
-        try:
-            deal_id = f"PL{int(time.time()) % 1000000:06d}"
-            expires_at = datetime.now() + timedelta(hours=DEAL_EXPIRE_HOURS)
-            
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                INSERT INTO deals 
-                (id, seller_id, seller_username, amount, currency, payment_method, payment_data, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (deal_id, seller_id, seller_username, amount, currency, payment_method, payment_data, expires_at.isoformat()))
-            self.conn.commit()
-            print(f"✅ Создана сделка {deal_id}")
-            return deal_id
-        except Exception as e:
-            print(f"❌ Ошибка создания сделки: {e}")
-            return None
-    
-    def get_deal(self, deal_id):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT * FROM deals WHERE id = ?", (deal_id,))
-            row = cursor.fetchone()
-            if row:
-                # Получаем информацию о колонках
-                cursor.execute("PRAGMA table_info(deals)")
-                columns_info = cursor.fetchall()
-                columns = [col[1] for col in columns_info]
-                
-                # Создаем словарь с безопасным доступом к данным
-                result = {
-                    'id': row[0], 
-                    'seller_id': row[1], 
-                    'seller_username': row[2],
-                    'buyer_id': row[3] if len(row) > 3 else None, 
-                    'buyer_username': row[4] if len(row) > 4 else None, 
-                    'amount': row[5] if len(row) > 5 else 0,
-                    'currency': row[6] if len(row) > 6 else 'RUB', 
-                    'payment_method': row[7] if len(row) > 7 else '', 
-                    'payment_data': row[8] if len(row) > 8 else '',
-                    'status': row[9] if len(row) > 9 else 'created'
-                }
-                
-                # Добавляем опциональные поля если они есть
-                if 'nft_sent' in columns:
-                    result['nft_sent'] = bool(row[columns.index('nft_sent')]) if len(row) > columns.index('nft_sent') else False
-                else:
-                    result['nft_sent'] = False
-                    
-                if 'admin_check' in columns:
-                    result['admin_check'] = bool(row[columns.index('admin_check')]) if len(row) > columns.index('admin_check') else False
-                else:
-                    result['admin_check'] = False
-                    
-                if 'check_requested' in columns:
-                    result['check_requested'] = bool(row[columns.index('check_requested')]) if len(row) > columns.index('check_requested') else False
-                else:
-                    result['check_requested'] = False
-                    
-                result['created_at'] = row[columns.index('created_at')] if 'created_at' in columns and len(row) > columns.index('created_at') else None
-                result['expires_at'] = row[columns.index('expires_at')] if 'expires_at' in columns and len(row) > columns.index('expires_at') else None
-                result['completed_at'] = row[columns.index('completed_at')] if 'completed_at' in columns and len(row) > columns.index('completed_at') else None
-                
-                return result
-            return None
-        except Exception as e:
-            print(f"❌ Ошибка получения сделки {deal_id}: {e}")
-            return None
-    
-    def update_deal(self, deal_id, **kwargs):
-        try:
-            cursor = self.conn.cursor()
-            set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
-            values = list(kwargs.values())
-            values.append(deal_id)
-            cursor.execute(f"UPDATE deals SET {set_clause} WHERE id = ?", values)
-            self.conn.commit()
-            print(f"✅ Обновлена сделка {deal_id}: {kwargs}")
-            return True
-        except Exception as e:
-            print(f"❌ Ошибка обновления сделки {deal_id}: {e}")
-            return False
-    
-    def get_pending_admin_checks(self):
-        """Получить сделки, требующие проверки администратора"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT * FROM deals WHERE check_requested = 1 AND admin_check = 0 AND status = 'paid'")
-            rows = cursor.fetchall()
-            return [{
-                'id': row[0], 
-                'seller_id': row[1], 
-                'seller_username': row[2],
-                'buyer_id': row[3], 
-                'buyer_username': row[4], 
-                'amount': row[5],
-                'currency': row[6]
-            } for row in rows]
-        except Exception as e:
-            print(f"❌ Ошибка получения сделок на проверку: {e}")
-            return []
-    
-    def save_state(self, user_id, state, data=None):
-        try:
-            cursor = self.conn.cursor()
-            data_json = json.dumps(data) if data else None
-            cursor.execute('''
-                INSERT OR REPLACE INTO user_states 
-                (user_id, state, data)
-                VALUES (?, ?, ?)
-            ''', (user_id, state, data_json))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            print(f"❌ Ошибка сохранения состояния: {e}")
-            return False
-    
-    def get_state(self, user_id):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT state, data FROM user_states WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            if row:
-                data = json.loads(row[1]) if row[1] else {}
-                return row[0], data
-            return None, {}
-        except Exception as e:
-            print(f"❌ Ошибка получения состояния: {e}")
-            return None, {}
-    
-    def clear_state(self, user_id):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            print(f"❌ Ошибка очистки состояния: {e}")
-            return False
-
-db = Database()
-
-# ==================== TELEGRAM API ====================
-def send_message(chat_id, text, keyboard=None, photo_file_id=None):
-    if photo_file_id:
-        url = f"{BASE_URL}/sendPhoto"
-        payload = {
-            'chat_id': chat_id,
-            'photo': photo_file_id,
-            'caption': text,
-            'parse_mode': 'HTML'
-        }
-    else:
-        url = f"{BASE_URL}/sendMessage"
-        payload = {
-            'chat_id': chat_id,
-            'text': text,
-            'parse_mode': 'HTML'
-        }
-    
-    if keyboard:
-        payload['reply_markup'] = json.dumps(keyboard)
-    
+    # Авторизация
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.status_code == 200
+        await client.start(phone=PHONE_NUMBER)
+        print("✅ Авторизация успешна!")
     except Exception as e:
-        print(f"Ошибка отправки сообщения: {e}")
-        return False
-
-def answer_callback(callback_id, text=None):
-    url = f"{BASE_URL}/answerCallbackQuery"
-    payload = {'callback_query_id': callback_id}
-    if text:
-        payload['text'] = text
+        print(f"❌ Ошибка авторизации: {e}")
+        print("📝 Проверь номер телефона и код подтверждения")
+        return
     
+    # Получаем канал
     try:
-        response = requests.post(url, json=payload, timeout=3)
-        return response.status_code == 200
-    except:
-        return False
-
-def create_invoice_link(title, description, payload, currency, prices, photo_url=None):
-    """
-    Создание ссылки на инвойс для оплаты через Telegram Stars
-    Для Telegram Stars нужно использовать валюту 'XTR'
-    """
-    url = f"{BASE_URL}/createInvoiceLink"
-    
-    # Для Telegram Stars используем специальную валюту
-    if currency == 'TELEGRAM_STARS':
-        currency_code = 'XTR'
-    else:
-        currency_code = currency
-    
-    payload_data = {
-        'title': title,
-        'description': description,
-        'payload': payload,
-        'currency': currency_code,
-        'prices': prices
-    }
-    
-    if photo_url:
-        payload_data['photo_url'] = photo_url
-    
-    try:
-        response = requests.post(url, json=payload_data, timeout=10)
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('ok'):
-                return result.get('result')
-        print(f"Ошибка создания инвойса: {response.text}")
-        return None
-    except Exception as e:
-        print(f"Ошибка создания инвойса: {e}")
-        return None
-
-# ==================== КЛАВИАТУРЫ ====================
-def main_menu(user_id):
-    user = db.get_user(user_id)
-    keyboard = [
-        [{'text': '🎁 Создать сделку', 'callback_data': 'create_deal'},
-         {'text': '💰 Оплатить', 'callback_data': 'pay_deal'}],
-        [{'text': '📋 Мои сделки', 'callback_data': 'my_deals'},
-         {'text': '💳 Реквизиты', 'callback_data': 'payment_methods'}]
-    ]
-    
-    if user and user['is_admin']:
-        keyboard.append([{'text': '🔷 Админ', 'callback_data': 'admin'}])
-    
-    return {'inline_keyboard': keyboard}
-
-def admin_menu():
-    return {
-        'inline_keyboard': [
-            [{'text': '📊 Статистика', 'callback_data': 'admin_stats'}],
-            [{'text': '👥 Пользователи', 'callback_data': 'admin_users'}],
-            [{'text': '🎁 Сделки', 'callback_data': 'admin_deals'}],
-            [{'text': '🔍 Проверить NFT', 'callback_data': 'admin_check_nft'}],
-            [{'text': '🖼️ Сменить фото', 'callback_data': 'admin_change_photo'}],
-            [{'text': '🔙 Главное меню', 'callback_data': 'main'}]
-        ]
-    }
-
-def payment_methods_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '💳 Добавить карту', 'callback_data': 'add_card'},
-             {'text': '💎 Добавить TON', 'callback_data': 'add_ton'}],
-            [{'text': '⭐ Telegram Stars', 'callback_data': 'telegram_stars_info'}],
-            [{'text': '📋 Мои реквизиты', 'callback_data': 'my_payments'}],
-            [{'text': '🔙 Назад', 'callback_data': 'main'}]
-        ]
-    }
-
-def telegram_stars_info_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '⭐ Создать сделку за Stars', 'callback_data': 'create_stars_deal'}],
-            [{'text': '📖 Как получить Stars', 'callback_data': 'stars_help'}],
-            [{'text': '🔙 Назад', 'callback_data': 'payment_methods'}]
-        ]
-    }
-
-def stars_help_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': '📱 Купить Stars', 'url': 'https://t.me/premium'}],
-            [{'text': '❓ Как это работает', 'callback_data': 'stars_info'}],
-            [{'text': '🔙 Назад', 'callback_data': 'telegram_stars_info'}]
-        ]
-    }
-
-def currency_keyboard():
-    keyboard = []
-    for code, info in CURRENCIES.items():
-        keyboard.append([{'text': f"{info['emoji']} {info['name']} ({info['symbol']})", 'callback_data': f'currency_{code}'}])
-    keyboard.append([{'text': '❌ Отмена', 'callback_data': 'main'}])
-    return {'inline_keyboard': keyboard}
-
-def cancel_button():
-    return {'inline_keyboard': [[{'text': '❌ Отмена', 'callback_data': 'main'}]]}
-
-def seller_actions_keyboard(deal_id):
-    return {
-        'inline_keyboard': [
-            [{'text': '✅ NFT отправлено', 'callback_data': f'nft_sent_{deal_id}'}],
-            [{'text': '📋 Мои сделки', 'callback_data': 'my_deals'}]
-        ]
-    }
-
-def seller_confirm_keyboard(deal_id):
-    return {
-        'inline_keyboard': [
-            [{'text': '📤 Уведомить админа о проверке', 'callback_data': f'request_check_{deal_id}'}],
-            [{'text': '📋 Мои сделки', 'callback_data': 'my_deals'}]
-        ]
-    }
-
-def admin_check_keyboard(deal_id):
-    return {
-        'inline_keyboard': [
-            [{'text': '✅ Да, NFT получен', 'callback_data': f'admin_confirm_{deal_id}'}],
-            [{'text': '❌ Нет, не получен', 'callback_data': f'admin_reject_{deal_id}'}],
-            [{'text': '🔍 Еще сделки', 'callback_data': 'admin_check_nft'}]
-        ]
-    }
-
-# ==================== ОСНОВНЫЕ ФУНКЦИИ ====================
-def handle_start(user_id, args=None):
-    db.clear_state(user_id)
-    
-    if args and args.startswith('deal_'):
-        deal_id = args.replace('deal_', '')
-        show_deal(user_id, deal_id)
-        return
-    
-    welcome_photo = media_manager.get_welcome_photo()
-    text = "🔷 <b>Platinum Guarant Bot</b>\n\nНадежный гарант для P2P сделок\n\n👇 Выберите действие:"
-    
-    if welcome_photo:
-        send_message(user_id, text, main_menu(user_id), photo_file_id=welcome_photo)
-    else:
-        send_message(user_id, text, main_menu(user_id))
-
-def handle_callback(user_id, data, callback_id=None):
-    # Сначала отвечаем на callback
-    if callback_id:
-        answer_callback(callback_id, "⌛ Обработка...")
-    
-    print(f"DEBUG: Обработка callback: user_id={user_id}, data={data}")
-    
-    if data == 'main':
-        handle_start(user_id)
-    
-    elif data == 'admin':
-        show_admin_panel(user_id)
-    
-    elif data == 'admin_stats':
-        show_admin_stats(user_id)
-    
-    elif data == 'admin_users':
-        show_admin_users(user_id)
-    
-    elif data == 'admin_deals':
-        show_admin_deals(user_id)
-    
-    elif data == 'admin_check_nft':
-        show_admin_nft_checks(user_id)
-    
-    elif data == 'admin_change_photo':
-        start_change_photo(user_id)
-    
-    elif data == 'create_deal':
-        check_payment_methods(user_id)
-    
-    elif data == 'pay_deal':
-        start_pay_deal(user_id)
-    
-    elif data == 'my_deals':
-        show_user_deals(user_id)
-    
-    elif data == 'payment_methods':
-        show_payment_methods_menu(user_id)
-    
-    elif data == 'add_card':
-        add_payment_method(user_id, 'card')
-    
-    elif data == 'add_ton':
-        add_payment_method(user_id, 'ton')
-    
-    elif data == 'my_payments':
-        show_user_payments(user_id)
-    
-    elif data == 'telegram_stars_info':
-        show_telegram_stars_info(user_id)
-    
-    elif data == 'create_stars_deal':
-        check_payment_methods_for_stars(user_id)
-    
-    elif data == 'stars_help':
-        show_stars_help(user_id)
-    
-    elif data == 'stars_info':
-        show_stars_info(user_id)
-    
-    elif data.startswith('pay_'):
-        deal_id = data.replace('pay_', '')
-        print(f"DEBUG: Оплата сделки {deal_id} пользователем {user_id}")
-        pay_deal(user_id, deal_id)
-    
-    elif data.startswith('currency_'):
-        currency = data.replace('currency_', '')
-        create_deal_with_currency(user_id, currency)
-    
-    elif data.startswith('nft_sent_'):
-        deal_id = data.replace('nft_sent_', '')
-        mark_nft_sent(user_id, deal_id)
-    
-    elif data.startswith('request_check_'):
-        deal_id = data.replace('request_check_', '')
-        request_admin_check(user_id, deal_id)
-    
-    elif data.startswith('admin_confirm_'):
-        deal_id = data.replace('admin_confirm_', '')
-        admin_confirm_nft(user_id, deal_id)
-    
-    elif data.startswith('admin_reject_'):
-        deal_id = data.replace('admin_reject_', '')
-        admin_reject_nft(user_id, deal_id)
-
-def show_telegram_stars_info(user_id):
-    text = """
-⭐ <b>Telegram Stars - Внутренняя валюта Telegram</b>
-
-<b>Что такое Telegram Stars?</b>
-• Внутренняя валюта Telegram для покупок
-• 1 Star ≈ 1 цент (0.01$)
-• Можно покупать цифровые товары, услуги
-
-<b>Как получить Stars:</b>
-1. Нажмите "📱 Купить Stars"
-2. Выберите количество Stars
-3. Оплатите через привязанную карту
-
-<b>Преимущества оплаты Stars:</b>
-• Мгновенная оплата
-• Без комиссий Telegram
-• Защищенные транзакции
-• Поддержка всех стран
-
-<b>Создать сделку за Stars:</b>
-"""
-    send_message(user_id, text, telegram_stars_info_keyboard())
-
-def show_stars_help(user_id):
-    text = """
-📱 <b>Как получить Telegram Stars</b>
-
-<b>Способ 1: Через @premium бота</b>
-1. Перейдите в @premium
-2. Выберите "Купить Stars"
-3. Выберите количество
-4. Оплатите картой
-
-<b>Способ 2: В настройках Telegram</b>
-1. Откройте настройки
-2. Выберите "Telegram Premium"
-3. Нажмите "Купить Stars"
-4. Выберите количество
-
-<b>Минимальная покупка:</b> 100 Stars (≈1$)
-<b>Максимальная покупка:</b> 10,000 Stars (≈100$)
-
-<b>Важно:</b> Stars можно использовать только для покупок в Telegram ботах и мини-приложениях.
-"""
-    send_message(user_id, text, stars_help_keyboard())
-
-def show_stars_info(user_id):
-    text = """
-❓ <b>Как работает оплата Stars в этом боте</b>
-
-<b>Процесс оплаты:</b>
-1. Продавец создает сделку за Stars
-2. Покупатель получает ссылку на оплату
-3. Покупатель оплачивает через Telegram Stars
-4. Бот автоматически получает уведомление об оплате
-5. Продавец отправляет NFT
-6. Администратор проверяет отправку
-7. Stars переводятся продавцу
-
-<b>Комиссия:</b>
-• Бот: {commission}% (стандартная комиссия)
-• Telegram: 0% (при оплате через Stars)
-
-<b>Безопасность:</b>
-• Все транзакции защищены Telegram
-• Автоматическое подтверждение оплаты
-• Гарант сохраняет Stars до отправки NFT
-
-<b>Конвертация:</b>
-• 100 Stars = 1$
-• 1000 Stars = 10$
-• 10000 Stars = 100$
-""".format(commission=COMMISSION_RATE)
-    send_message(user_id, text, telegram_stars_info_keyboard())
-
-def check_payment_methods_for_stars(user_id):
-    """Проверка реквизитов для сделки за Stars (Stars не требуют реквизитов)"""
-    # Для Stars не требуются реквизиты, сразу переходим к вводу суммы
-    db.save_state(user_id, 'waiting_amount', {'payment_method': 'telegram_stars', 'payment_data': 'Telegram Stars Wallet'})
-    send_message(user_id, 
-        f"⭐ <b>Введите сумму сделки в Telegram Stars</b>\n\nМинимальная сумма: {MIN_DEAL_AMOUNT} Star\n\n<i>Пример: 1000 (это примерно 10$)</i>",
-        cancel_button())
-
-def check_payment_methods(user_id):
-    if not db.has_payment_methods(user_id):
-        send_message(user_id, 
-            "❌ <b>У вас нет реквизитов для получения платежей</b>\n\n"
-            "Добавьте хотя бы один реквизит для создания сделок:\n\n"
-            "💳 <b>или используйте Telegram Stars</b>",
-            payment_methods_keyboard())
-        return
-    
-    payments = db.get_payment_methods(user_id)
-    if payments:
-        state_data = {'payment_method': payments[0]['type'], 'payment_data': payments[0]['data']}
-        db.save_state(user_id, 'waiting_amount', state_data)
-        send_message(user_id, 
-            f"💰 <b>Введите сумму сделки</b>\n\nМинимальная сумма: {MIN_DEAL_AMOUNT}",
-            cancel_button())
-
-def add_payment_method(user_id, method_type):
-    if method_type == 'card':
-        db.save_state(user_id, 'waiting_card')
-        send_message(user_id, 
-            "💳 <b>Введите номер банковской карты:</b>\n\nПример: 1234 5678 9012 3456",
-            cancel_button())
-    elif method_type == 'ton':
-        db.save_state(user_id, 'waiting_ton')
-        send_message(user_id,
-            "💎 <b>Введите адрес TON кошелька:</b>\n\nПример: EQDv3l_Dq7-Mq0MqceBL-5T5N7HFyPkO8XZPcE9U7XbYwMz",
-            cancel_button())
-
-def create_deal_with_currency(user_id, currency):
-    state, state_data = db.get_state(user_id)
-    
-    if state != 'waiting_currency':
-        send_message(user_id, "❌ Ошибка процесса", main_menu(user_id))
-        db.clear_state(user_id)
-        return
-    
-    user = db.get_user(user_id)
-    
-    if 'amount' not in state_data or 'payment_method' not in state_data:
-        send_message(user_id, "❌ Ошибка данных", main_menu(user_id))
-        db.clear_state(user_id)
-        return
-    
-    deal_id = db.create_deal(
-        user_id,
-        user['username'] or user['first_name'],
-        state_data['amount'],
-        currency,
-        state_data['payment_method'],
-        state_data['payment_data']
-    )
-    
-    if deal_id:
-        commission = state_data['amount'] * COMMISSION_RATE / 100
-        final_amount = state_data['amount'] - commission
+        channel = await client.get_entity(CHANNEL_LINK)
+        print(f"📢 Подключен к каналу: {channel.title}")
         
-        # Получаем username бота для создания ссылки
-        try:
-            bot_info = requests.get(f"{BASE_URL}/getMe").json()
-            if bot_info.get('ok'):
-                bot_username = bot_info['result']['username']
-                share_link = f"https://t.me/{bot_username}?start=deal_{deal_id}"
+        # Проверяем последний пост
+        last_msg = await client.get_messages(channel, limit=1)
+        if last_msg:
+            print(f"📌 Последний пост: {last_msg[0].id}")
+            if last_msg[0].id in processed_posts:
+                print(f"✅ Уже обработан")
+            else:
+                print(f"🆕 Ожидает комментария")
                 
-                # Для Telegram Stars создаем платежную ссылку
-                if currency == 'TELEGRAM_STARS':
-                    # Создаем инвойс для оплаты Stars
-                    title = f"Сделка #{deal_id}"
-                    description = f"Оплата сделки за {state_data['amount']} Telegram Stars"
-                    payload = f"deal_{deal_id}"
-                    
-                    # Цена в Stars (минимальная цена в центах)
-                    prices = [{
-                        'label': f"{state_data['amount']} Telegram Stars",
-                        'amount': int(state_data['amount'])  # Stars в центах
-                    }]
-                    
-                    invoice_link = create_invoice_link(
-                        title=title,
-                        description=description,
-                        payload=payload,
-                        currency=currency,
-                        prices=prices
-                    )
-                    
-                    if invoice_link:
-                        share_link = invoice_link
-                        stars_info = "\n\n<b>⚠️ Для оплаты используйте ссылку выше</b>"
-                    else:
-                        stars_info = "\n\n<b>⚠️ Оплата Stars временно недоступна</b>"
-                else:
-                    stars_info = ""
-            else:
-                share_link = f"Используйте ID сделки: {deal_id}"
-                stars_info = ""
-        except:
-            share_link = f"Используйте ID сделки: {deal_id}"
-            stars_info = ""
-        
-        text = f"""
-✅ <b>Сделка создана!</b>
-
-<b>ID:</b> <code>{deal_id}</code>
-<b>Сумма:</b> {state_data['amount']} {CURRENCIES[currency]['symbol']}
-<b>Комиссия ({COMMISSION_RATE}%):</b> {commission:.2f}
-<b>Вы получите:</b> {final_amount:.2f}
-
-<b>Ссылка для покупателя:</b>
-<code>{share_link}</code>
-{stars_info}
-"""
-        
-        if currency != 'TELEGRAM_STARS':
-            text += f"\n<b>Реквизиты для оплаты:</b>\n{state_data['payment_data']}"
-        
-        text += f"\n\n<b>После оплаты отправьте NFT в {SUPPORT_CHANNEL}</b>"
-        
-        send_message(user_id, text, main_menu(user_id))
-    else:
-        send_message(user_id, "❌ Ошибка создания сделки", main_menu(user_id))
-    
-    db.clear_state(user_id)
-
-def show_deal(user_id, deal_id):
-    deal = db.get_deal(deal_id)
-    if not deal:
-        send_message(user_id, "❌ Сделка не найдена", main_menu(user_id))
+    except Exception as e:
+        print(f"❌ Не удалось найти канал: {e}")
+        print("💡 Убедись, что канал существует и ты на него подписан")
         return
     
-    if deal['status'] != 'created':
-        send_message(user_id, f"❌ Сделка уже не активна (статус: {deal['status']})", main_menu(user_id))
-        return
+    print("\n🔍 Сканирую последние посты...")
     
-    text = f"""
-🎁 <b>Сделка от @{deal['seller_username']}</b>
-
-<b>ID:</b> <code>{deal['id']}</code>
-<b>Сумма:</b> {deal['amount']} {CURRENCIES[deal['currency']]['symbol']}
-<b>Комиссия ({COMMISSION_RATE}%):</b> {deal['amount'] * COMMISSION_RATE / 100:.2f}
-
-"""
-    
-    if deal['currency'] != 'TELEGRAM_STARS':
-        text += f"<b>Реквизиты продавца:</b>\n{deal['payment_data']}\n\n"
-    
-    text += "<b>Оплатить сделку?</b>"
-    
-    keyboard = {
-        'inline_keyboard': [
-            [{'text': '✅ Оплатить', 'callback_data': f'pay_{deal_id}'}],
-            [{'text': '🔙 Назад', 'callback_data': 'main'}]
-        ]
-    }
-    
-    send_message(user_id, text, keyboard)
-
-def start_pay_deal(user_id):
-    db.save_state(user_id, 'waiting_deal_id')
-    send_message(user_id,
-        "🔍 <b>Введите ID сделки для оплаты</b>\n\nПример: PL123456",
-        cancel_button())
-
-def pay_deal(user_id, deal_id):
-    print(f"DEBUG: Начинаем оплату сделки {deal_id}")
-    
-    deal = db.get_deal(deal_id)
-    if not deal:
-        print(f"DEBUG: Сделка {deal_id} не найдена")
-        send_message(user_id, "❌ Сделка не найдена", main_menu(user_id))
-        return
-    
-    if deal['status'] != 'created':
-        print(f"DEBUG: Сделка {deal_id} не в статусе created, текущий статус: {deal['status']}")
-        send_message(user_id, f"❌ Сделка уже не активна (статус: {deal['status']})", main_menu(user_id))
-        return
-    
-    user = db.get_user(user_id)
-    if not user:
-        print(f"DEBUG: Пользователь {user_id} не найден в БД")
-        send_message(user_id, "❌ Ошибка: пользователь не найден", main_menu(user_id))
-        return
-    
-    print(f"DEBUG: Обновляем сделку {deal_id}")
-    db.update_deal(deal_id, 
-        buyer_id=user_id,
-        buyer_username=user['username'] or user['first_name'],
-        status='paid')
-    
-    print(f"DEBUG: Уведомляем продавца {deal['seller_id']}")
-    # Уведомляем продавца с кнопками
-    seller_text = f"""
-💰 <b>Сделка оплачена!</b>
-
-<b>ID:</b> <code>{deal_id}</code>
-<b>Покупатель:</b> @{user['username'] or user['first_name']}
-<b>Сумма:</b> {deal['amount']} {CURRENCIES[deal['currency']]['symbol']}
-
-<b>1. Отправьте NFT в {SUPPORT_CHANNEL}</b>
-<b>2. Нажмите "NFT отправлено" ниже:</b>
-"""
-    seller_sent = send_message(deal['seller_id'], seller_text, seller_actions_keyboard(deal_id))
-    print(f"DEBUG: Сообщение продавцу отправлено: {seller_sent}")
-    
-    # Уведомляем покупателя
-    print(f"DEBUG: Уведомляем покупателя {user_id}")
-    buyer_text = f"""
-✅ <b>Оплата принята!</b>
-
-Сделка <code>{deal_id}</code> оплачена.
-Ожидайте отправки NFT от продавца.
-
-<b>Продавец отправит NFT в {SUPPORT_CHANNEL}</b>
-"""
-    buyer_sent = send_message(user_id, buyer_text, main_menu(user_id))
-    print(f"DEBUG: Сообщение покупателю отправлено: {buyer_sent}")
-    
-    print(f"DEBUG: Оплата сделки {deal_id} завершена успешно")
-
-def process_text(user_id, text):
-    state, state_data = db.get_state(user_id)
-    
-    if not state:
-        if text.startswith('/start'):
-            args = text.split(' ')[1] if len(text.split(' ')) > 1 else None
-            handle_start(user_id, args)
-        else:
-            send_message(user_id, "👋 Используйте кнопки меню или /start", main_menu(user_id))
-        return
-    
-    if state == 'waiting_amount':
-        try:
-            amount = float(text.replace(',', '.'))
-            if amount < MIN_DEAL_AMOUNT:
-                send_message(user_id, f"❌ Минимальная сумма: {MIN_DEAL_AMOUNT}")
-                return
-            
-            state_data['amount'] = amount
-            db.save_state(user_id, 'waiting_currency', state_data)
-            
-            # Если это оплата Stars, сразу создаем сделку
-            if state_data.get('payment_method') == 'telegram_stars':
-                create_deal_with_currency(user_id, 'TELEGRAM_STARS')
-            else:
-                send_message(user_id, "💱 <b>Выберите валюту:</b>", currency_keyboard())
-        except:
-            send_message(user_id, "❌ Неверный формат суммы")
-    
-    elif state == 'waiting_card':
-        if len(text) >= 16 and text.replace(' ', '').isdigit():
-            card_number = text.replace(' ', '')
-            db.add_payment_method(user_id, 'card', card_number)
-            send_message(user_id, "✅ Карта успешно добавлена!", payment_methods_keyboard())
-            db.clear_state(user_id)
-        else:
-            send_message(user_id, "❌ Неверный номер карты")
-    
-    elif state == 'waiting_ton':
-        if len(text) > 30:
-            db.add_payment_method(user_id, 'ton', text)
-            send_message(user_id, "✅ TON кошелек добавлен!", payment_methods_keyboard())
-            db.clear_state(user_id)
-        else:
-            send_message(user_id, "❌ Неверный адрес TON кошелька")
-    
-    elif state == 'waiting_deal_id':
-        show_deal(user_id, text.upper())
-        db.clear_state(user_id)
-
-def process_photo(user_id, file_id):
-    state, state_data = db.get_state(user_id)
-    
-    user = db.get_user(user_id)
-    if not user or not user['is_admin']:
-        return
-    
-    if state == 'admin_change_photo':
-        if media_manager.save_welcome_photo(file_id):
-            send_message(user_id, "✅ Фото приветствия успешно обновлено!", admin_menu())
-        else:
-            send_message(user_id, "❌ Ошибка сохранения фото", admin_menu())
-        db.clear_state(user_id)
-
-# ... остальные функции остаются без изменений ...
-
-def show_payment_methods_menu(user_id):
-    send_message(user_id, "💳 <b>Управление реквизитами</b>\n\n👇 Выберите действие:", payment_methods_keyboard())
-
-def show_user_payments(user_id):
-    payments = db.get_payment_methods(user_id)
-    
-    text = "💳 <b>Ваши реквизиты:</b>\n\n"
-    
-    if payments:
-        for payment in payments:
-            if payment['type'] == 'card':
-                masked = f"**** **** **** {payment['data'][-4:]}"
-                text += f"• 💳 Карта: {masked}\n"
-            else:
-                text += f"• 💎 TON: {payment['data'][:20]}...\n"
-    else:
-        text += "❌ У вас нет добавленных реквизитов\n\n"
-    
-    text += "\n⭐ <b>Telegram Stars всегда доступны</b>\n<i>Для оплаты Stars не нужны реквизиты</i>"
-    
-    send_message(user_id, text, payment_methods_keyboard())
-
-def mark_nft_sent(user_id, deal_id):
-    deal = db.get_deal(deal_id)
-    if not deal:
-        send_message(user_id, "❌ Сделка не найдена", main_menu(user_id))
-        return
-    
-    if deal['seller_id'] != user_id:
-        send_message(user_id, "❌ Вы не являетесь продавцом этой сделки", main_menu(user_id))
-        return
-    
-    if deal['status'] != 'paid':
-        send_message(user_id, f"❌ Сделка не в статусе 'оплачена'", main_menu(user_id))
-        return
-    
-    db.update_deal(deal_id, nft_sent=1)
-    
-    # Сообщение продавцу с кнопкой для уведомления админа
-    text = f"""
-✅ <b>Отправка NFT подтверждена!</b>
-
-Сделка: <code>{deal_id}</code>
-Вы отправили NFT в {SUPPORT_CHANNEL}
-
-<b>Теперь уведомите администратора о необходимости проверки:</b>
-"""
-    send_message(user_id, text, seller_confirm_keyboard(deal_id))
-
-def request_admin_check(user_id, deal_id):
-    print(f"DEBUG: Запрос проверки NFT для сделки {deal_id}")
-    
-    deal = db.get_deal(deal_id)
-    if not deal:
-        print(f"DEBUG: Сделка {deal_id} не найдена")
-        send_message(user_id, "❌ Сделка не найдена", main_menu(user_id))
-        return
-    
-    if deal['seller_id'] != user_id:
-        print(f"DEBUG: Пользователь {user_id} не является продавцом сделки {deal_id}")
-        send_message(user_id, "❌ Вы не являетесь продавцом этой сделки", main_menu(user_id))
-        return
-    
-    if not deal.get('nft_sent', False):
-        print(f"DEBUG: NFT не отправлен для сделки {deal_id}")
-        send_message(user_id, "❌ Сначала подтвердите отправку NFT", seller_actions_keyboard(deal_id))
-        return
-    
-    # Отмечаем что запрошена проверка
-    print(f"DEBUG: Устанавливаем check_requested=1 для сделки {deal_id}")
-    db.update_deal(deal_id, check_requested=1)
-    
-    # Уведомляем продавца
-    send_message(user_id, 
-        f"📤 <b>Администратор уведомлен!</b>\n\n"
-        f"Сделка: <code>{deal_id}</code>\n"
-        f"Администратор проверит получение NFT в {SUPPORT_CHANNEL}\n\n"
-        f"Вы получите уведомление о результате проверки.",
-        main_menu(user_id))
-    
-    # Уведомляем ВСЕХ админов с кнопками ДА/НЕТ
-    admins = db.get_admins()
-    print(f"DEBUG: Найдено администраторов: {admins}")
-    
-    if not admins:
-        print(f"DEBUG: Нет администраторов в базе!")
-        send_message(user_id, "⚠️ Администраторы не найдены в системе", main_menu(user_id))
-        return
-    
-    admin_text = f"""
-🔍 <b>Требуется проверка NFT</b>
-
-<b>ID сделки:</b> <code>{deal_id}</code>
-<b>Продавец:</b> @{deal['seller_username']}
-<b>Покупатель:</b> @{deal['buyer_username'] or 'не указан'}
-<b>Сумма:</b> {deal['amount']} {CURRENCIES[deal['currency']]['symbol']}
-
-<b>Продавец утверждает что отправил NFT в {SUPPORT_CHANNEL}</b>
-
-<b>Проверьте канал и подтвердите:</b>
-"""
-    
-    sent_count = 0
-    for admin_id in admins:
-        print(f"DEBUG: Отправляем уведомление администратору {admin_id}")
-        admin_sent = send_message(admin_id, admin_text, admin_check_keyboard(deal_id))
-        if admin_sent:
-            sent_count += 1
-            print(f"DEBUG: Сообщение администратору {admin_id} отправлено")
-        else:
-            print(f"DEBUG: Не удалось отправить сообщение администратору {admin_id}")
-    
-    print(f"DEBUG: Отправлено уведомлений {sent_count}/{len(admins)} администраторам")
-
-# ... остальные функции без изменений ...
-
-# ==================== ОСНОВНОЙ ЦИКЛ ====================
-def main():
-    print("🔷 Запуск Platinum Guarant Bot...")
-    print(f"Админы: {', '.join([f'@{admin}' for admin in ADMIN_USERNAMES])}")
-    print(f"Поддержка: {SUPPORT_CHANNEL}")
-    print(f"Комиссия: {COMMISSION_RATE}%")
-    print(f"Валюты: {', '.join(CURRENCIES.keys())}")
-    print("=" * 50)
-    
-    # Проверяем подключение к боту
+    # Проверяем последние 20 постов при старте
     try:
-        response = requests.get(f"{BASE_URL}/getMe", timeout=10)
-        if response.status_code == 200:
-            bot_info = response.json()
-            print(f"✅ Бот запущен: @{bot_info['result']['username']}")
-            print(f"✅ Ссылка на бота: https://t.me/{bot_info['result']['username']}")
-        else:
-            print("❌ Ошибка подключения к Telegram")
+        messages = await client.get_messages(channel, limit=20)
+        new_posts = 0
+        for msg in messages:
+            if msg.id not in processed_posts:
+                new_posts += 1
+                print(f"  • Пост #{msg.id} - будет прокомментирован")
+        print(f"\n📊 Найдено новых постов для комментария: {new_posts}")
+    except Exception as e:
+        print(f"⚠️ Не удалось получить историю: {e}")
+    
+    print("\n" + "="*45)
+    print("⏳ Бот ЗАПУЩЕН и ждет новые посты!")
+    print("📱 Можно свернуть приложение (будет работать в фоне)")
+    print("="*45 + "\n")
+    
+    @client.on(events.NewMessage(chats=channel))
+    async def handler(event):
+        message = event.message
+        msg_id = message.id
+        
+        # Проверяем, не комментировали ли уже
+        if msg_id in processed_posts:
             return
-    except Exception as e:
-        print(f"❌ Ошибка подключения: {e}")
-        return
-    
-    offset = 0
-    while True:
-        try:
-            response = requests.get(
-                f"{BASE_URL}/getUpdates",
-                params={'offset': offset, 'timeout': 30}
-            )
-            
-            if response.status_code == 200:
-                updates = response.json().get('result', [])
-                
-                for update in updates:
-                    offset = update['update_id'] + 1
-                    
-                    if 'message' in update:
-                        msg = update['message']
-                        user_id = msg['from']['id']
-                        
-                        db.save_user({
-                            'id': user_id,
-                            'username': msg['from'].get('username'),
-                            'first_name': msg['from'].get('first_name')
-                        })
-                        
-                        if 'photo' in msg:
-                            file_id = msg['photo'][-1]['file_id']
-                            process_photo(user_id, file_id)
-                        
-                        elif 'text' in msg:
-                            process_text(user_id, msg['text'])
-                    
-                    elif 'callback_query' in update:
-                        callback = update['callback_query']
-                        user_id = callback['from']['id']
-                        data = callback['data']
-                        callback_id = callback['id']
-                        
-                        db.save_user({
-                            'id': user_id,
-                            'username': callback['from'].get('username'),
-                            'first_name': callback['from'].get('first_name')
-                        })
-                        
-                        handle_callback(user_id, data, callback_id)
         
-        except KeyboardInterrupt:
-            print("\n🛑 Остановка бота...")
-            break
+        # Информация о посте
+        print(f"\n{'='*30}")
+        print(f"🆕 НОВЫЙ ПОСТ #{msg_id}")
+        if message.text:
+            preview = message.text[:50] + "..." if len(message.text) > 50 else message.text
+            print(f"📝 Текст: {preview}")
+        
+        # Случайная задержка (2-6 секунд) - чтобы не спамить
+        delay = random.randint(2, 6)
+        print(f"⏳ Задержка {delay} сек...")
+        await asyncio.sleep(delay)
+        
+        try:
+            # Отправляем комментарий
+            await client.send_message(
+                entity=channel,
+                message=COMMENT_TEXT,
+                comment_to=msg_id
+            )
+            print(f"✅ Комментарий '{COMMENT_TEXT}' оставлен!")
+            
+            # Сохраняем ID поста
+            processed_posts.add(msg_id)
+            save_post(msg_id)
+            print(f"💾 Пост #{msg_id} сохранен")
+            
+            # Пауза между комментариями (5-10 секунд)
+            if len(processed_posts) % 5 == 0:
+                print(f"📊 Всего обработано постов: {len(processed_posts)}")
+            
         except Exception as e:
-            print(f"⚠️ Ошибка: {e}")
-            time.sleep(5)
+            if "FLOOD" in str(e).upper():
+                print(f"⚠️ Telegram просит подождать (flood)")
+                await asyncio.sleep(30)
+            elif "CHAT_WRITE_FORBIDDEN" in str(e):
+                print(f"❌ Нельзя писать комментарии в этом канале")
+            else:
+                print(f"❌ Ошибка: {e}")
+        
+        print(f"{'='*30}")
+    
+    # Держим бота запущенным
+    await client.run_until_disconnected()
 
-if __name__ == "__main__":
-    main()
-  
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен")
+    except Exception as e:
+        print(f"💥 Ошибка: {e}")
+        print("\n🔄 Перезапусти бота через 10 секунд...")
+        import time
+        time.sleep(10)
